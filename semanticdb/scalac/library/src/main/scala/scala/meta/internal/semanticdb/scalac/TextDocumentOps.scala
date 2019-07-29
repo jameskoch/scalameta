@@ -181,6 +181,9 @@ trait TextDocumentOps { self: SemanticdbOps =>
             super.apply(mtree)
           }
         }
+        val unitSource = unit.toSource
+        println("OVERALL STRUCTURE:")
+        println(unitSource.syntax)
         traverser(unit.toSource)
       }
 
@@ -228,7 +231,10 @@ trait TextDocumentOps { self: SemanticdbOps =>
             if (gsym0 == null) return
             if (gsym0.isUselessOccurrence) return
             if (mtree.pos == m.Position.None) return
-            if (occurrences.contains(mtree.pos)) return
+            if (occurrences.contains(mtree.pos)) {
+              println(s"Rejecting ${mtree} because we already have a result for ${mtree.pos}")
+              return
+            }
 
             val gsym = {
               def isClassRefInCtorCall = gsym0.isConstructor && mtree.isNot[m.Name.Anonymous]
@@ -244,12 +250,16 @@ trait TextDocumentOps { self: SemanticdbOps =>
               binders += mtree.pos
               if (mvalpatstart.contains(mtree.pos.start)) {
                 if (gsym.name.endsWith(mtree.value)) {
+                  println(s"success(${mtree}) -> isDefinition -> mpatoccurrences")
                   mpatoccurrences(mtree.pos) = symbol
                 }
               } else {
+                println(s"success(${mtree}) -> isDefinition -> occurrences")
                 occurrences(mtree.pos) = symbol
               }
             } else {
+              println(s"success(${mtree}) -> notDefinition -> occurrences")
+//              require(mtree.toString != "foo")
               val selectionFromStructuralType = gsym.owner.isRefinementClass
               if (!selectionFromStructuralType) occurrences(mtree.pos) = symbol
             }
@@ -269,19 +279,21 @@ trait TextDocumentOps { self: SemanticdbOps =>
             tryWithin(mwithins, gsym)
             tryWithin(mwithinctors, gsym.primaryConstructor)
           }
-          private def tryNamedArg(gtree: g.Tree, gstart: Int, gpoint: Int): Unit = {
-            if (margnames.contains(gstart) || margnames.contains(gpoint)) {
+          private def tryNamedArg(gmethod: g.Tree, gstart: Int, gpoint: Int): Unit = {
+            if ((margnames.contains(gstart) || margnames.contains(gpoint)) && gmethod.symbol != null && gmethod.symbol.isMethod) {
+              println("tryNamedArg(true)")
               for {
                 margnames <- margnames.get(gstart) ++ margnames.get(gpoint)
                 margname <- margnames
-                if gtree.symbol != null && gtree.symbol.isMethod
-                gparams <- gtree.symbol.paramss
+                gparams <- gmethod.symbol.paramss
                 gparam <- gparams.find(_.name.decoded == margname.value)
               } {
                 success(margname, gparam)
               }
             }
           }
+
+          // This does not recurse. Call it only when you're pretty sure a syntactic match can be resolved. It tried various flavors of resolution.
           private def tryFindMtree(gtree: g.Tree): Unit = {
             def tryMstart(start: Int): Boolean = {
               if (!mstarts.contains(start)) return false
@@ -293,10 +305,13 @@ trait TextDocumentOps { self: SemanticdbOps =>
               success(mends(end), gtree.symbol)
               return true
             }
-            def tryMpos(start: Int, end: Int): Boolean = {
+            def tryExactPositionMatch(start: Int, end: Int): Boolean = {
               if (!mstarts.contains(start)) return false
               val mtree = mstarts(start)
-              if (mtree.pos.end != end) return false
+              if (mtree.pos.end != end) {
+                println(s"tryExactPositionMatch - rejecting match against ${mtree} because supplied end $end != syntactic parsed end ${mtree.pos.end}")
+                return false
+              }
               success(mtree, gtree.symbol)
               return true
             }
@@ -338,9 +353,9 @@ trait TextDocumentOps { self: SemanticdbOps =>
               }
             }
 
-            // Ideally, we'd like a perfect match when gtree.pos == mtree.pos.
+            // Ideally, we'd like a perfect match when gmethod.pos == mtree.pos.
             // Unfortunately, this is often not the case as demonstrated by a bunch of cases above and below.
-            if (tryMpos(gstart, gend)) return
+            if (tryExactPositionMatch(gstart, gend)) return
 
             val gsym = gtree.symbol
             gtree match {
@@ -374,6 +389,7 @@ trait TextDocumentOps { self: SemanticdbOps =>
               case gtree: g.DefTree =>
                 tryMstart(gpoint)
               case gtree: g.This =>
+                println("MATCHED `THIS`")
                 tryMstart(gpoint)
               case gtree: g.Super =>
                 tryMend(gend - 1)
@@ -494,6 +510,7 @@ trait TextDocumentOps { self: SemanticdbOps =>
             if (!isVisitedParent(gtree)) {
               gtree match {
                 case gview: g.ApplyImplicitView =>
+                  println("ApplyImplicitView")
                   val pos = gtree.pos.toMeta
                   synthetics += s.Synthetic(
                     range = Some(pos.toRange),
@@ -507,6 +524,7 @@ trait TextDocumentOps { self: SemanticdbOps =>
                   )
                   isVisited += gview.fun
                 case gimpl: g.ApplyToImplicitArgs =>
+                  println("ApplyToImplicitArgs")
                   gimpl.fun match {
                     case gview: g.ApplyImplicitView =>
                       isVisitedParent += gview
@@ -559,6 +577,7 @@ trait TextDocumentOps { self: SemanticdbOps =>
                         range = Some(fun.pos.toMeta.toRange)
                       )
                   }
+                  println("g.TypeApply(fun, targs @ List(targ, _*)) ")
                   synthetics += s.Synthetic(
                     range = Some(fun.pos.toMeta.toRange),
                     tree = s.TypeApplyTree(
@@ -586,6 +605,8 @@ trait TextDocumentOps { self: SemanticdbOps =>
                 case _ =>
                 // do nothing
               }
+            } else {
+              println("Already visited parent tree")
             }
           }
 
@@ -599,6 +620,7 @@ trait TextDocumentOps { self: SemanticdbOps =>
 
             gtree match {
               case OriginalTreeOf(original) =>
+                println("OriginalTreeOf")
                 traverse(original)
               case ConstfoldOf(original) =>
                 traverse(original)
@@ -617,13 +639,16 @@ trait TextDocumentOps { self: SemanticdbOps =>
               case SelfTypeOf(original) =>
                 traverse(original)
               case SelectOf(original) =>
+                println("SelectOf(original)")
                 traverse(original)
               case g.Function(params, body) if params.exists { param =>
                     param.symbol.isSynthetic ||
                     param.name.decoded.startsWith("x$")
                   } =>
+                println("function w/ synthetic")
                 traverse(body)
               case gtree: g.TypeTree if gtree.original != null =>
+                println(s"TypeTree w/ original // Orig: ${g.show(gtree.original)} New: ${g.show(gtree)}")
                 traverse(gtree.original)
               case gtree: g.TypeTreeWithDeferredRefCheck =>
                 traverse(gtree.check())
@@ -643,6 +668,7 @@ trait TextDocumentOps { self: SemanticdbOps =>
                   binders += mpos
                 }
               case _: g.Apply | _: g.TypeApply =>
+                println(s"case _: g.Apply | _: g.TypeApply => // ${g.show(gtree)} // attachments: ${g.show(gtree.attachments.all)}")
                 tryFindSynthetic(gtree)
                 if (gtree.pos != null && gtree.pos.isRange) {
                   tryNamedArg(gtree, gtree.pos.start, gtree.pos.point)
@@ -652,6 +678,50 @@ trait TextDocumentOps { self: SemanticdbOps =>
                 tryFindSynthetic(select)
               case gtree: g.AppliedTypeTree =>
                 tryFindMtree(gtree)
+              case gblock @ g.Block(stats, expr) if gblock.hasAttachment[g.analyzer.NamedApplyInfo] =>
+                // Result of NamesDefaults.transformNamedApplication.
+                // If we don't inject ourselves
+                println(s"NamedApplyInfo BLOCK: ${g.show(gblock)}")
+                println(s"Attachments: ${g.show(gblock.attachments.all)}")
+                println(s"Block.pos: ${g.show(gblock.pos)}")
+
+                val Some(g.analyzer.NamedApplyInfo(qual, targs, vargss, _)) = gblock.attachments.get[g.analyzer.NamedApplyInfo]
+                println(s"x1: ${vargss.head.head.pos}") // 101 (open parens before arg 1)
+                println(s"x3: ${vargss.head.tail.head.pos}") // 97 (space before f in foo?)
+                println(s"x2: ${vargss.head.tail.tail.head.pos}") // 108 (space before arg 3)
+
+                // Most important is that we be able to resolve expr (the method itself).
+                // expr.pos has been mangled to is that the method invocation itself has gone missing.
+                // NamedApplyInfo BLOCK: {
+                //  <artifact> val x$1: Int = 1;
+                //  <artifact> val x$2: Int = 3;
+                //  <artifact> val x$3: Int = ao.this.foo$default$2;
+                //  ao.this.foo(x$1, x$3, x$2)
+                //}
+                println("expr.pos")
+                println(expr.pos)
+                expr match {
+                  case g.Apply(fun, args) =>
+                    println("fun.pos")
+                    println(fun.pos)
+
+                    // WIthout this
+
+                    tryFindMtree(fun)
+
+                  case _ => println("DID NOT MATCH")
+                }
+
+                println("mstarts")
+                println(mstarts)
+
+                println("margnames")
+                println(margnames)
+
+                // Of secondary important, would like to be able to locate the parameters passed using Named syntax, and
+                // call tryNamedArg against the "name" syntax. TODO - Test case for this.
+
+//                tryFindMtree(gtree)
               case _ =>
                 tryFindMtree(gtree)
             }
@@ -674,6 +744,9 @@ trait TextDocumentOps { self: SemanticdbOps =>
           s.SymbolOccurrence(Some(pos.toRange), flatSym, role)
         }
       }.toList
+
+      println("finalOccurrences:")
+      finalOccurrences.foreach(println)
 
       val diagnostics = unit.reportedDiagnostics(mstarts)
 
